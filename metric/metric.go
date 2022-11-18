@@ -363,6 +363,10 @@ func convertField(v interface{}) interface{} {
 		if v != nil {
 			return float64(*v)
 		}
+	case []Row:
+		return v
+	case map[string]interface{}:
+		return v
 	default:
 		return nil
 	}

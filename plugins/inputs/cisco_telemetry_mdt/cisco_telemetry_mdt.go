@@ -7,10 +7,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/influxdata/telegraf/metric"
 	"io"
 	"net"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +26,6 @@ import (
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
-	"github.com/influxdata/telegraf/metric"
 	internaltls "github.com/influxdata/telegraf/plugins/common/tls"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
@@ -277,6 +276,7 @@ func (c *CiscoTelemetryMDT) handleTCPClient(conn net.Conn) error {
 	}
 
 	var payload bytes.Buffer
+	sourceIp := conn.RemoteAddr().String()
 
 	for {
 		// Read and validate dialout telemetry header
@@ -304,7 +304,7 @@ func (c *CiscoTelemetryMDT) handleTCPClient(conn net.Conn) error {
 			return fmt.Errorf("TCP dialout premature EOF")
 		}
 
-		c.handleTelemetry(payload.Bytes())
+		c.handleTelemetry(payload.Bytes(), sourceIp)
 	}
 }
 
@@ -316,6 +316,7 @@ func (c *CiscoTelemetryMDT) MdtDialout(stream dialout.GRPCMdtDialout_MdtDialoutS
 	}
 
 	var chunkBuffer bytes.Buffer
+	sourceIP := peerInCtx.Addr.String()
 
 	for {
 		packet, err := stream.Recv()
@@ -333,13 +334,13 @@ func (c *CiscoTelemetryMDT) MdtDialout(stream dialout.GRPCMdtDialout_MdtDialoutS
 
 		// Reassemble chunked telemetry data received from NX-OS
 		if packet.TotalSize == 0 {
-			c.handleTelemetry(packet.Data)
+			c.handleTelemetry(packet.Data, sourceIP)
 		} else if int(packet.TotalSize) <= c.MaxMsgSize {
 			if _, err := chunkBuffer.Write(packet.Data); err != nil {
 				c.acc.AddError(fmt.Errorf("writing packet %q failed: %v", packet.Data, err))
 			}
 			if chunkBuffer.Len() >= int(packet.TotalSize) {
-				c.handleTelemetry(chunkBuffer.Bytes())
+				c.handleTelemetry(chunkBuffer.Bytes(), sourceIP)
 				chunkBuffer.Reset()
 			}
 		} else {
@@ -355,7 +356,7 @@ func (c *CiscoTelemetryMDT) MdtDialout(stream dialout.GRPCMdtDialout_MdtDialoutS
 }
 
 // Handle telemetry packet from any transport, decode and add as measurement
-func (c *CiscoTelemetryMDT) handleTelemetry(data []byte) {
+func (c *CiscoTelemetryMDT) handleTelemetry(data []byte, sourceIP string) {
 	msg := &telemetry.Telemetry{}
 	err := proto.Unmarshal(data, msg)
 	if err != nil {
@@ -363,328 +364,29 @@ func (c *CiscoTelemetryMDT) handleTelemetry(data []byte) {
 		return
 	}
 
-	grouper := metric.NewSeriesGrouper()
-	for _, gpbkv := range msg.DataGpbkv {
-		// Produce metadata tags
-		var tags map[string]string
+	grouper := metric.NewGrouper()
+	gbpkv, err := json.Marshal(msg)
+	if err != nil {
+		c.Log.Errorf("Gpbkv Parse Failure")
+	}
 
-		// Top-level field may have measurement timestamp, if not use message timestamp
-		measured := gpbkv.Timestamp
-		if measured == 0 {
-			measured = msg.MsgTimestamp
-		}
+	field := metric.NewField()
+	field.GbpkvParse(gbpkv, sourceIP)
+	timestamp := time.Unix(int64(msg.MsgTimestamp/1000), int64(msg.MsgTimestamp%1000)*1000000)
 
-		timestamp := time.Unix(int64(measured/1000), int64(measured%1000)*1000000)
-
-		// Find toplevel GPBKV fields "keys" and "content"
-		var keys, content *telemetry.TelemetryField = nil, nil
-		for _, field := range gpbkv.Fields {
-			if field.Name == "keys" {
-				keys = field
-			} else if field.Name == "content" {
-				content = field
-			}
-		}
-
-		// if the keys and content fields are missing, skip the message as it
-		// does not have parsable data used by Telegraf
-		if keys == nil || content == nil {
-			continue
-		}
-
-		// Parse keys
-		tags = make(map[string]string, len(keys.Fields)+3)
-		tags["source"] = msg.GetNodeIdStr()
-		if msgID := msg.GetSubscriptionIdStr(); msgID != "" {
-			tags["subscription"] = msgID
-		}
-		tags["path"] = msg.GetEncodingPath()
-
-		for _, subfield := range keys.Fields {
-			c.parseKeyField(tags, subfield, "")
-		}
-
-		// Parse values
-		for _, subfield := range content.Fields {
-			c.parseContentField(grouper, subfield, "", msg.EncodingPath, tags, timestamp)
-		}
+	if err := grouper.Add(msg.EncodingPath, timestamp, "Telemetry", field.Telemetry); err != nil {
+		c.Log.Errorf("adding field %q to group failed: Telemetry", err)
+	}
+	if err := grouper.Add(msg.EncodingPath, timestamp, "Rows", field.Rows); err != nil {
+		c.Log.Errorf("adding field %q to group failed: rows", err)
+	}
+	if err := grouper.Add(msg.EncodingPath, timestamp, "Source", field.Source); err != nil {
+		c.Log.Errorf("adding field %q to group failed: Source", err)
 	}
 
 	for _, groupedMetric := range grouper.Metrics() {
 		c.acc.AddMetric(groupedMetric)
 	}
-}
-
-func decodeValue(field *telemetry.TelemetryField) interface{} {
-	switch val := field.ValueByType.(type) {
-	case *telemetry.TelemetryField_BytesValue:
-		return val.BytesValue
-	case *telemetry.TelemetryField_StringValue:
-		if len(val.StringValue) > 0 {
-			return val.StringValue
-		}
-	case *telemetry.TelemetryField_BoolValue:
-		return val.BoolValue
-	case *telemetry.TelemetryField_Uint32Value:
-		return val.Uint32Value
-	case *telemetry.TelemetryField_Uint64Value:
-		return val.Uint64Value
-	case *telemetry.TelemetryField_Sint32Value:
-		return val.Sint32Value
-	case *telemetry.TelemetryField_Sint64Value:
-		return val.Sint64Value
-	case *telemetry.TelemetryField_DoubleValue:
-		return val.DoubleValue
-	case *telemetry.TelemetryField_FloatValue:
-		return val.FloatValue
-	}
-	return nil
-}
-
-func decodeTag(field *telemetry.TelemetryField) string {
-	switch val := field.ValueByType.(type) {
-	case *telemetry.TelemetryField_BytesValue:
-		return string(val.BytesValue)
-	case *telemetry.TelemetryField_StringValue:
-		return val.StringValue
-	case *telemetry.TelemetryField_BoolValue:
-		if val.BoolValue {
-			return "true"
-		}
-		return "false"
-	case *telemetry.TelemetryField_Uint32Value:
-		return strconv.FormatUint(uint64(val.Uint32Value), 10)
-	case *telemetry.TelemetryField_Uint64Value:
-		return strconv.FormatUint(val.Uint64Value, 10)
-	case *telemetry.TelemetryField_Sint32Value:
-		return strconv.FormatInt(int64(val.Sint32Value), 10)
-	case *telemetry.TelemetryField_Sint64Value:
-		return strconv.FormatInt(val.Sint64Value, 10)
-	case *telemetry.TelemetryField_DoubleValue:
-		return strconv.FormatFloat(val.DoubleValue, 'f', -1, 64)
-	case *telemetry.TelemetryField_FloatValue:
-		return strconv.FormatFloat(float64(val.FloatValue), 'f', -1, 32)
-	default:
-		return ""
-	}
-}
-
-// Recursively parse tag fields
-func (c *CiscoTelemetryMDT) parseKeyField(tags map[string]string, field *telemetry.TelemetryField, prefix string) {
-	localname := strings.ReplaceAll(field.Name, "-", "_")
-	name := localname
-	if len(localname) == 0 {
-		name = prefix
-	} else if len(prefix) > 0 {
-		name = prefix + "/" + localname
-	}
-
-	if tag := decodeTag(field); len(name) > 0 && len(tag) > 0 {
-		if _, exists := tags[localname]; !exists { // Use short keys whenever possible
-			tags[localname] = tag
-		} else {
-			tags[name] = tag
-		}
-	}
-
-	for _, subfield := range field.Fields {
-		c.parseKeyField(tags, subfield, name)
-	}
-}
-
-func (c *CiscoTelemetryMDT) parseRib(grouper *metric.SeriesGrouper, field *telemetry.TelemetryField,
-	encodingPath string, tags map[string]string, timestamp time.Time) {
-	// RIB
-	measurement := encodingPath
-	for _, subfield := range field.Fields {
-		//For Every table fill the keys which are vrfName, address and masklen
-		switch subfield.Name {
-		case "vrfName", "address", "maskLen":
-			tags[subfield.Name] = decodeTag(subfield)
-		}
-		if value := decodeValue(subfield); value != nil {
-			grouper.Add(measurement, tags, timestamp, subfield.Name, value)
-		}
-		if subfield.Name != "nextHop" {
-			continue
-		}
-		//For next hop table fill the keys in the tag - which is address and vrfname
-		for _, subf := range subfield.Fields {
-			for _, ff := range subf.Fields {
-				switch ff.Name {
-				case "address", "vrfName":
-					key := "nextHop/" + ff.Name
-					tags[key] = decodeTag(ff)
-				}
-				if value := decodeValue(ff); value != nil {
-					name := "nextHop/" + ff.Name
-					grouper.Add(measurement, tags, timestamp, name, value)
-				}
-			}
-		}
-	}
-}
-
-func (c *CiscoTelemetryMDT) parseClassAttributeField(grouper *metric.SeriesGrouper, field *telemetry.TelemetryField,
-	encodingPath string, tags map[string]string, timestamp time.Time) {
-	// DME structure: https://developer.cisco.com/site/nxapi-dme-model-reference-api/
-	var nxAttributes *telemetry.TelemetryField
-	isDme := strings.Contains(encodingPath, "sys/")
-	if encodingPath == "rib" {
-		//handle native data path rib
-		c.parseRib(grouper, field, encodingPath, tags, timestamp)
-		return
-	}
-	if field == nil || !isDme || len(field.Fields) == 0 || len(field.Fields[0].Fields) == 0 || len(field.Fields[0].Fields[0].Fields) == 0 {
-		return
-	}
-
-	if field.Fields[0] != nil && field.Fields[0].Fields != nil && field.Fields[0].Fields[0] != nil && field.Fields[0].Fields[0].Fields[0].Name != "attributes" {
-		return
-	}
-	nxAttributes = field.Fields[0].Fields[0].Fields[0].Fields[0]
-
-	for _, subfield := range nxAttributes.Fields {
-		if subfield.Name == "dn" {
-			tags["dn"] = decodeTag(subfield)
-		} else {
-			c.parseContentField(grouper, subfield, "", encodingPath, tags, timestamp)
-		}
-	}
-}
-
-func (c *CiscoTelemetryMDT) parseContentField(grouper *metric.SeriesGrouper, field *telemetry.TelemetryField, prefix string,
-	encodingPath string, tags map[string]string, timestamp time.Time) {
-	name := strings.ReplaceAll(field.Name, "-", "_")
-
-	if (name == "modTs" || name == "createTs") && decodeValue(field) == "never" {
-		return
-	}
-	if len(name) == 0 {
-		name = prefix
-	} else if len(prefix) > 0 {
-		name = prefix + "/" + name
-	}
-
-	extraTags := c.extraTags[strings.ReplaceAll(encodingPath, "-", "_")+"/"+name]
-
-	if value := decodeValue(field); value != nil {
-		// Do alias lookup, to shorten measurement names
-		measurement := encodingPath
-		if alias, ok := c.internalAliases[encodingPath]; ok {
-			measurement = alias
-		} else {
-			c.mutex.Lock()
-			if _, haveWarned := c.warned[encodingPath]; !haveWarned {
-				c.Log.Debugf("No measurement alias for encoding path: %s", encodingPath)
-				c.warned[encodingPath] = struct{}{}
-			}
-			c.mutex.Unlock()
-		}
-
-		if val := c.nxosValueXform(field, value, encodingPath); val != nil {
-			grouper.Add(measurement, tags, timestamp, name, val)
-		} else {
-			grouper.Add(measurement, tags, timestamp, name, value)
-		}
-		return
-	}
-
-	if len(extraTags) > 0 {
-		for _, subfield := range field.Fields {
-			if _, isExtraTag := extraTags[subfield.Name]; isExtraTag {
-				tags[name+"/"+strings.ReplaceAll(subfield.Name, "-", "_")] = decodeTag(subfield)
-			}
-		}
-	}
-
-	var nxAttributes, nxChildren, nxRows *telemetry.TelemetryField
-	isNXOS := !strings.ContainsRune(encodingPath, ':') // IOS-XR and IOS-XE have a colon in their encoding path, NX-OS does not
-	isEVENT := isNXOS && strings.Contains(encodingPath, "EVENT-LIST")
-	nxChildren = nil
-	nxAttributes = nil
-	for _, subfield := range field.Fields {
-		if isNXOS && subfield.Name == "attributes" && len(subfield.Fields) > 0 {
-			nxAttributes = subfield.Fields[0]
-		} else if isNXOS && subfield.Name == "children" && len(subfield.Fields) > 0 {
-			if !isEVENT {
-				nxChildren = subfield
-			} else {
-				sub := subfield.Fields
-				if len(sub) > 0 && sub[0] != nil && sub[0].Fields[0].Name == "subscriptionId" && len(sub[0].Fields) >= 2 {
-					nxAttributes = sub[0].Fields[1].Fields[0].Fields[0].Fields[0].Fields[0].Fields[0]
-				}
-			}
-			//if nxAttributes == NULL then class based query.
-			if nxAttributes == nil {
-				//call function walking over walking list.
-				for _, sub := range subfield.Fields {
-					c.parseClassAttributeField(grouper, sub, encodingPath, tags, timestamp)
-				}
-			}
-		} else if isNXOS && strings.HasPrefix(subfield.Name, "ROW_") {
-			nxRows = subfield
-		} else if _, isExtraTag := extraTags[subfield.Name]; !isExtraTag { // Regular telemetry decoding
-			c.parseContentField(grouper, subfield, name, encodingPath, tags, timestamp)
-		}
-	}
-
-	if nxAttributes == nil && nxRows == nil {
-		return
-	} else if nxRows != nil {
-		// NXAPI structure: https://developer.cisco.com/docs/cisco-nexus-9000-series-nx-api-cli-reference-release-9-2x/
-		for _, row := range nxRows.Fields {
-			for i, subfield := range row.Fields {
-				if i == 0 { // First subfield contains the index, promote it from value to tag
-					tags[prefix] = decodeTag(subfield)
-					//We can have subfield so recursively handle it.
-					if len(row.Fields) == 1 {
-						tags["row_number"] = strconv.FormatInt(int64(i), 10)
-						c.parseContentField(grouper, subfield, "", encodingPath, tags, timestamp)
-					}
-				} else {
-					c.parseContentField(grouper, subfield, "", encodingPath, tags, timestamp)
-				}
-				// Nxapi we can't identify keys always from prefix
-				tags["row_number"] = strconv.FormatInt(int64(i), 10)
-			}
-			delete(tags, prefix)
-		}
-		return
-	}
-
-	// DME structure: https://developer.cisco.com/site/nxapi-dme-model-reference-api/
-	rn := ""
-	dn := false
-
-	for _, subfield := range nxAttributes.Fields {
-		if subfield.Name == "rn" {
-			rn = decodeTag(subfield)
-		} else if subfield.Name == "dn" {
-			dn = true
-		}
-	}
-
-	if len(rn) > 0 {
-		tags[prefix] = rn
-	} else if !dn { // Check for distinguished name being present
-		c.acc.AddError(fmt.Errorf("NX-OS decoding failed: missing dn field"))
-		return
-	}
-
-	for _, subfield := range nxAttributes.Fields {
-		if subfield.Name != "rn" {
-			c.parseContentField(grouper, subfield, "", encodingPath, tags, timestamp)
-		}
-	}
-
-	if nxChildren != nil {
-		// This is a nested structure, children will inherit relative name keys of parent
-		for _, subfield := range nxChildren.Fields {
-			c.parseContentField(grouper, subfield, prefix, encodingPath, tags, timestamp)
-		}
-	}
-	delete(tags, prefix)
 }
 
 func (c *CiscoTelemetryMDT) Address() net.Addr {
