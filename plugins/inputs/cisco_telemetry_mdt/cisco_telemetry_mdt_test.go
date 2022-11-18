@@ -84,7 +84,7 @@ func TestHandleTelemetryTwoSimple(t *testing.T) {
 	data, err := proto.Marshal(telemetry)
 	require.NoError(t, err)
 
-	c.handleTelemetry(data)
+	c.handleTelemetry(data, "127.0.0.1")
 	require.Empty(t, acc.Errors)
 
 	tags := map[string]string{"path": "type:model/some/path", "name": "str", "uint64": "1234", "source": "hostname", "subscription": "subscription"}
@@ -156,7 +156,7 @@ func TestHandleTelemetrySingleNested(t *testing.T) {
 	data, err := proto.Marshal(telemetry)
 	require.NoError(t, err)
 
-	c.handleTelemetry(data)
+	c.handleTelemetry(data, "127.0.0.1")
 	require.Empty(t, acc.Errors)
 
 	tags := map[string]string{"path": "type:model/nested/path", "level": "3", "source": "hostname", "subscription": "subscription"}
@@ -226,7 +226,7 @@ func TestHandleEmbeddedTags(t *testing.T) {
 	data, err := proto.Marshal(telemetry)
 	require.NoError(t, err)
 
-	c.handleTelemetry(data)
+	c.handleTelemetry(data, "127.0.0.1")
 	require.Empty(t, acc.Errors)
 
 	tags1 := map[string]string{"path": "type:model/extra", "foo": "bar", "source": "hostname", "subscription": "subscription", "list/name": "entry1"}
@@ -315,7 +315,7 @@ func TestHandleNXAPI(t *testing.T) {
 	data, err := proto.Marshal(telemetry)
 	require.NoError(t, err)
 
-	c.handleTelemetry(data)
+	c.handleTelemetry(data, "127.0.0.1")
 	require.Empty(t, acc.Errors)
 
 	tags1 := map[string]string{"path": "show nxapi", "foo": "bar", "TABLE_nxapi": "i1", "row_number": "0", "source": "hostname", "subscription": "subscription"}
@@ -392,7 +392,7 @@ func TestHandleNXAPIXformNXAPI(t *testing.T) {
 	data, err := proto.Marshal(telemetry)
 	require.NoError(t, err)
 
-	c.handleTelemetry(data)
+	c.handleTelemetry(data, "127.0.0.1")
 	require.Empty(t, acc.Errors)
 
 	tags1 := map[string]string{
@@ -485,7 +485,7 @@ func TestHandleNXXformMulti(t *testing.T) {
 	data, err := proto.Marshal(telemetry)
 	require.NoError(t, err)
 
-	c.handleTelemetry(data)
+	c.handleTelemetry(data, "127.0.0.1")
 	require.Empty(t, acc.Errors)
 	//validate various transformation scenaarios newly added in the code.
 	fields := map[string]interface{}{"portIdV": "12", "portDesc": "100", "test": int64(281474976710655), "subscriptionId": "2814749767106551"}
@@ -558,7 +558,7 @@ func TestHandleNXDME(t *testing.T) {
 	data, err := proto.Marshal(telemetry)
 	require.NoError(t, err)
 
-	c.handleTelemetry(data)
+	c.handleTelemetry(data, "127.0.0.1")
 	require.Empty(t, acc.Errors)
 
 	tags1 := map[string]string{"path": "sys/dme", "foo": "bar", "fooEntity": "some-rn", "source": "hostname", "subscription": "subscription"}
